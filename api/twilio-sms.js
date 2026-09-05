@@ -134,10 +134,31 @@ export default async function handler(req, res) {
         .eq('id', user.id)
         .single();
       const fromPhone = profile?.twilio_phone_number || process.env.TWILIO_PHONE_NUMBER;
-      if (!fromPhone) return res.status(500).json({ error: 'No outbound phone number on your account' });
+      const msgServiceSid = process.env.TWILIO_MESSAGING_SERVICE_SID;
+      if (!fromPhone && !msgServiceSid) return res.status(500).json({ error: 'No outbound phone number on your account' });
 
       const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-      const sms = await client.messages.create({ body, from: fromPhone, to });
+      // Prefer the A2P 10DLC messaging service (it applies the registered
+      // campaign and picks a sender from its pool); fall back to the bare number.
+      const sendOpts = msgServiceSid
+        ? { body, to, messagingServiceSid: msgServiceSid }
+        : { body, to, from: fromPhone };
+
+      let sms;
+      try {
+        sms = await client.messages.create(sendOpts);
+      } catch (twErr) {
+        // Surface WHY it failed instead of a generic 500, so the inbox can tell
+        // the user the real reason (e.g. not yet A2P-registered, or opted out).
+        const code = twErr && twErr.code;
+        console.error('Twilio send failed:', code, twErr && twErr.message);
+        const reason =
+          code === 30034 ? 'This number isn’t approved for A2P 10DLC texting yet, so carriers blocked the message.' :
+          code === 21610 ? 'This contact replied STOP and is unsubscribed — you can’t text them unless they text START first.' :
+          code === 21408 || code === 21606 ? 'This number can’t send SMS (not SMS-enabled or not owned by your account).' :
+          (twErr && twErr.message) || 'Message could not be sent.';
+        return res.status(502).json({ error: reason, twilio_code: code || null });
+      }
 
       const { data: saved, error } = await supabase.from('messages').insert({
         user_id: user.id,
